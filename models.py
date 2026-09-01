@@ -15,6 +15,7 @@ class Merchant(Base):
     __tablename__ = "merchants"
     merchant_id = Column(String, primary_key=True)
     name        = Column(String, nullable=False)
+    city        = Column(String, nullable=False) 
     category    = Column(String, nullable=False)
     lat         = Column(Float,  nullable=False)
     lon         = Column(Float,  nullable=False)
