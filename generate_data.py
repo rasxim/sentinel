@@ -43,7 +43,10 @@ DAILY_WEIGHTS = [0.35, 0.35, 0.20, 0.10]
 
 N_DAYS = 90
 FAVORITES = 5
+TRAVEL_PROB = 0.25          # chance an account takes one trip in the 90 days
 START = TODAY - timedelta(days=N_DAYS)
+
+N_CARD_TESTING_ACCOUNTS = 60
 
 def make_accounts(n):
     rows=[]
@@ -75,7 +78,6 @@ def make_merchants(n):
     return rows
 
 def make_transactions(accounts, merchants):
-    # Group merchants by city so each account shops locally.
     by_city = {}
     for m in merchants:
         by_city.setdefault(m["city"], []).append(m)
@@ -86,14 +88,24 @@ def make_transactions(accounts, merchants):
         favorites = random.sample(local, min(FAVORITES, len(local)))
         log_typical = math.log(acct["typical_amount"])
 
+        # About a quarter of people take one trip somewhere.
+        trip = None
+        if random.random() < TRAVEL_PROB:
+            dest = random.choice([c for c in CITIES if c[0] != acct["home_city"]])
+            start_day = random.randint(5, N_DAYS - 8)
+            trip = (dest[0], start_day, start_day + random.randint(2, 6))
+
         for day in range(N_DAYS):
+            away = trip is not None and trip[1] <= day < trip[2]
             count = random.choices(DAILY_COUNTS, weights=DAILY_WEIGHTS)[0]
 
             for _ in range(count):
-                # 80% of the time they go somewhere familiar.
-                merchant = (random.choice(favorites)
-                            if random.random() < 0.80
-                            else random.choice(local))
+                if away:
+                    merchant = random.choice(by_city[trip[0]])
+                else:
+                    merchant = (random.choice(favorites)
+                                if random.random() < 0.80
+                                else random.choice(local))
 
                 hour = random.choices(range(24), weights=HOUR_WEIGHTS)[0]
                 ts = START + timedelta(days=day, hours=hour,
@@ -121,11 +133,51 @@ def make_transactions(accounts, merchants):
                     "fraud_type": None,
                 })
 
-    # Sort by time, then number them — so IDs run in chronological order.
-    rows.sort(key=lambda r: r["ts"])
-    for i, row in enumerate(rows):
-        row["txn_id"] = f"TXN{i:08d}"
     return rows
+
+def make_card_testing_fraud(accounts, merchants):
+    # A stolen card gets probed with a burst of tiny charges to see if it still works.
+    fraud_accounts = random.sample(accounts, N_CARD_TESTING_ACCOUNTS)
+    rows = []
+
+    for acct in fraud_accounts:
+        burst_size = random.randint(6, 20)
+        window_minutes = random.randint(5, 40)
+
+        start_day = random.randint(1, N_DAYS - 2)
+        burst_start = START + timedelta(
+            days=start_day,
+            hours=random.randint(0, 23),
+            minutes=random.randint(0, 59),
+        )
+
+        for _ in range(burst_size):
+            merchant = random.choice(merchants)  # random, not the account's local set
+            ts = burst_start + timedelta(seconds=random.uniform(0, window_minutes * 60))
+            amount = round(random.uniform(0.50, 12.00), 2)
+            card_present = random.random() < 0.10  # "mostly card-not-present"
+
+            if card_present:
+                lat = merchant["lat"] + random.uniform(-0.002, 0.002)
+                lon = merchant["lon"] + random.uniform(-0.002, 0.002)
+            else:
+                lat, lon = acct["home_lat"], acct["home_lon"]
+
+            rows.append({
+                "account_id": acct["account_id"],
+                "merchant_id": merchant["merchant_id"],
+                "amount": amount,
+                "ts": ts,
+                "lat": lat,
+                "lon": lon,
+                "card_present": card_present,
+                "is_fraud": True,
+                "fraud_type": "card_testing",
+            })
+
+    return rows
+
+
 
 def main():
     session = SessionLocal()
@@ -142,6 +194,12 @@ def main():
     session.commit()
 
     txns = make_transactions(accounts, merchants)
+    txns += make_card_testing_fraud(accounts, merchants)
+
+    txns.sort(key=lambda r: r["ts"])
+    for i, row in enumerate(txns):
+        row["txn_id"] = f"TXN{i:08d}"
+
     for i in range(0, len(txns), 5000):
         session.execute(insert(Transaction), txns[i:i + 5000])
     session.commit()
@@ -150,5 +208,6 @@ def main():
     print(f"merchants:    {session.query(Merchant).count()}")
     print(f"transactions: {session.query(Transaction).count()}")
     session.close()
+
 if __name__ == "__main__":
     main()
