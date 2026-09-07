@@ -2,3 +2,6 @@
 __pycache__/
 *.db
 .env
+
+# Build artifacts - regenerate with generate_data.py / features.py
+features.csv

@@ -1,4 +1,4 @@
-from sqlalchemy import (Column, String, Float, Boolean, DateTime, ForeignKey, Index)
+from sqlalchemy import (Column, String, Float, Boolean, DateTime, ForeignKey, Index, Integer)
 from db import Base 
 
 #Account table in database
@@ -33,5 +33,16 @@ class Transaction(Base):
     is_fraud     = Column(Boolean,  nullable=False, default=False)
     fraud_type   = Column(String,   nullable=True)
 
+class Decision(Base):
+    __tablename__ = "decisions"
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    txn_id         = Column(String, nullable=False)
+    account_id     = Column(String, ForeignKey("accounts.account_id"), nullable=False)
+    amount         = Column(Float,  nullable=False)
+    typical_amount = Column(Float,  nullable=False)
+    ratio          = Column(Float,  nullable=False)
+    decision       = Column(String, nullable=False)
+    ts             = Column(DateTime, nullable=False)   # when the transaction happened
+    scored_at      = Column(DateTime, nullable=False)   # when we decided
 #Index statement
 Index("ix_transac_account_ts",Transaction.account_id,Transaction.ts)
