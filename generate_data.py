@@ -47,6 +47,8 @@ TRAVEL_PROB = 0.25          # chance an account takes one trip in the 90 days
 START = TODAY - timedelta(days=N_DAYS)
 
 N_CARD_TESTING_ACCOUNTS = 60
+N_IMPOSSIBLE_TRAVEL_ACCOUNTS = 80
+N_ACCOUNT_TAKEOVER_ACCOUNTS = 50
 
 def make_accounts(n):
     rows=[]
@@ -177,7 +179,117 @@ def make_card_testing_fraud(accounts, merchants):
 
     return rows
 
+def make_impossible_travel_fraud(accounts, merchants, txns):
+    # A cloned card is used in a different city while the real cardholder's
+    # actual card stays put — anchored to one of the account's real transactions.
+    merchants_by_id = {m["merchant_id"]: m for m in merchants}
 
+    by_city = {}
+    for m in merchants:
+        by_city.setdefault(m["city"], []).append(m)
+
+    txns_by_account = {}
+    for t in txns:
+        txns_by_account.setdefault(t["account_id"], []).append(t)
+
+    fraud_accounts = random.sample(accounts, N_IMPOSSIBLE_TRAVEL_ACCOUNTS)
+    rows = []
+
+    for acct in fraud_accounts:
+        acct_txns = txns_by_account.get(acct["account_id"])
+        if not acct_txns:
+            continue
+
+        anchor = random.choice(acct_txns)
+        anchor_city = merchants_by_id[anchor["merchant_id"]]["city"]
+
+        dest_city, dest_lat, dest_lon = random.choice(
+            [c for c in CITIES if c[0] != anchor_city]
+        )
+
+        burst_size = random.randint(2, 4)
+        burst_start = anchor["ts"] + timedelta(minutes=random.uniform(20, 90))
+        log_typical = math.log(acct["typical_amount"])
+
+        for _ in range(burst_size):
+            merchant = random.choice(by_city[dest_city])
+            ts = burst_start + timedelta(minutes=random.uniform(0, 45))
+            amount = max(1.0, round(random.lognormvariate(log_typical, 0.6), 2))
+
+            lat = merchant["lat"] + random.uniform(-0.002, 0.002)
+            lon = merchant["lon"] + random.uniform(-0.002, 0.002)
+
+            rows.append({
+                "account_id": acct["account_id"],
+                "merchant_id": merchant["merchant_id"],
+                "amount": amount,
+                "ts": ts,
+                "lat": lat,
+                "lon": lon,
+                "card_present": True,
+                "is_fraud": True,
+                "fraud_type": "impossible_travel",
+            })
+
+    return rows
+
+def make_account_takeover_fraud(accounts, merchants, txns):
+    # Months of normal behavior, then a short episode of larger purchases
+    # at merchants this specific account has never once used.
+    txns_by_account = {}
+    for t in txns:
+        txns_by_account.setdefault(t["account_id"], []).append(t)
+
+    fraud_accounts = random.sample(accounts, N_ACCOUNT_TAKEOVER_ACCOUNTS)
+    rows = []
+
+    for acct in fraud_accounts:
+        acct_txns = txns_by_account.get(acct["account_id"])
+        if not acct_txns:
+            continue
+
+        visited_ids = {t["merchant_id"] for t in acct_txns}
+        unfamiliar = [m for m in merchants if m["merchant_id"] not in visited_ids]
+        if not unfamiliar:
+            continue
+
+        burst_size = random.randint(3, 8)
+
+        # Somewhere in the last 45 days of the 90-day window.
+        episode_start_day = random.randint(N_DAYS - 45, N_DAYS - 2)
+        episode_span_days = random.randint(1, 5)
+
+        for _ in range(burst_size):
+            merchant = random.choice(unfamiliar)
+
+            day = episode_start_day + random.uniform(0, episode_span_days)
+            hour = random.choices(range(24), weights=HOUR_WEIGHTS)[0]
+            ts = START + timedelta(days=day, hours=hour,
+                                    minutes=random.randint(0, 59),
+                                    seconds=random.randint(0, 59))
+
+            amount = round(acct["typical_amount"] * random.uniform(1.5, 8.0), 2)
+            card_present = random.random() < 0.70
+
+            if card_present:
+                lat = merchant["lat"] + random.uniform(-0.002, 0.002)
+                lon = merchant["lon"] + random.uniform(-0.002, 0.002)
+            else:
+                lat, lon = acct["home_lat"], acct["home_lon"]
+
+            rows.append({
+                "account_id": acct["account_id"],
+                "merchant_id": merchant["merchant_id"],
+                "amount": amount,
+                "ts": ts,
+                "lat": lat,
+                "lon": lon,
+                "card_present": card_present,
+                "is_fraud": True,
+                "fraud_type": "account_takeover",
+            })
+
+    return rows
 
 def main():
     session = SessionLocal()
@@ -194,7 +306,10 @@ def main():
     session.commit()
 
     txns = make_transactions(accounts, merchants)
-    txns += make_card_testing_fraud(accounts, merchants)
+    fraud = make_card_testing_fraud(accounts, merchants)
+    fraud += make_impossible_travel_fraud(accounts, merchants, txns)  # anchor to genuine txns only
+    fraud += make_account_takeover_fraud(accounts, merchants, txns)   # unfamiliar merchants from genuine history only
+    txns += fraud
 
     txns.sort(key=lambda r: r["ts"])
     for i, row in enumerate(txns):
