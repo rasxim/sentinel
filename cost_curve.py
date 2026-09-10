@@ -73,8 +73,8 @@ ax.set_title("Cost-optimal threshold selection")
 ax.legend()
 ax.grid(alpha=0.25)
 fig.tight_layout()
-fig.savefig("cost_curve.png", dpi=150)
-print("\nsaved cost_curve.png")
+fig.savefig("docs/cost_curve.png", dpi=150)
+print("\nsaved docs/cost_curve.png")
 
 
 # -------------------------------------------------- two thresholds: the policy
