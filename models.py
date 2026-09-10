@@ -41,6 +41,7 @@ class Decision(Base):
     amount         = Column(Float,  nullable=False)
     typical_amount = Column(Float,  nullable=False)
     ratio          = Column(Float,  nullable=False)
+    fraud_probability = Column(Float, nullable=False)
     decision       = Column(String, nullable=False)
     ts             = Column(DateTime, nullable=False)   # when the transaction happened
     scored_at      = Column(DateTime, nullable=False)   # when we decided
