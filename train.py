@@ -59,7 +59,16 @@ print(f"PR-AUC: {lr_prauc:.4f}   ({lr_prauc / base_rate:.1f}x no-skill)")
 
 
 # ---------------------------------------------------------------- XGBoost
-xgb = XGBClassifier(
+# Shared by the real model and the shuffle control, so the control stays a
+# like-for-like test.
+#
+# No monotonic constraint on the amount features. It was tried: forcing
+# "larger amount => never lower risk" cut PR-AUC from 0.895 to 0.865 and
+# account-takeover recall from 57% to 44%, because fraud risk is U-shaped in
+# amount - tiny charges are card testing, large ones are takeover - and a
+# monotone function cannot represent a U. Amounts beyond the training range
+# are handled by a rule in the service instead (see amount_ratio_max below).
+XGB_PARAMS = dict(
     n_estimators=300,
     max_depth=5,
     learning_rate=0.1,
@@ -68,6 +77,8 @@ xgb = XGBClassifier(
     eval_metric="aucpr",
     random_state=SEED,
 )
+
+xgb = XGBClassifier(**XGB_PARAMS)
 xgb.fit(X_train, y_train)
 xgb_probs = xgb.predict_proba(X_test)[:, 1]
 xgb_prauc = average_precision_score(y_test, xgb_probs)
@@ -90,15 +101,7 @@ for name, score in importances[:8]:
 rng = np.random.default_rng(SEED)
 y_shuffled = pd.Series(rng.permutation(y_train.values), index=y_train.index)
 
-xgb_shuf = XGBClassifier(
-    n_estimators=300,
-    max_depth=5,
-    learning_rate=0.1,
-    subsample=0.9,
-    colsample_bytree=0.9,
-    eval_metric="aucpr",
-    random_state=SEED,
-)
+xgb_shuf = XGBClassifier(**XGB_PARAMS)
 xgb_shuf.fit(X_train, y_shuffled)
 shuf_probs = xgb_shuf.predict_proba(X_test)[:, 1]
 shuf_prauc = average_precision_score(y_test, shuf_probs)
@@ -114,5 +117,12 @@ else:
 
 
 # ---------------------------------------------------------------- save
-joblib.dump({"model": xgb, "features": feature_names}, "model.joblib")
-print("\nsaved model.joblib")
+# Tree models cannot extrapolate: every value above the largest one seen in
+# training lands in the same leaf. The service uses this to recognise inputs
+# the model has no evidence about and hand them to a rule instead.
+amount_ratio_max = float(X_train["amount_ratio"].max())
+print(f"\nlargest amount_ratio seen in training: {amount_ratio_max:.2f}x")
+
+joblib.dump({"model": xgb, "features": feature_names,
+             "amount_ratio_max": amount_ratio_max}, "model.joblib")
+print("saved model.joblib")

@@ -156,7 +156,7 @@ select:hover, input:hover { border-color: var(--faint); }
 .dot-decline { background: var(--decline); }
 
 .feed-head, .row-main {
-  display: grid; grid-template-columns: 58px minmax(0, 1fr) 104px 168px 92px 20px; gap: 14px; align-items: center;
+  display: grid; grid-template-columns: 58px minmax(0, 1fr) 104px 168px 116px 20px; gap: 14px; align-items: center;
   padding: 0 16px;
 }
 .feed-head { font-size: 11px; letter-spacing: 0.07em; text-transform: uppercase; color: var(--muted); height: 34px; border-bottom: 1px solid var(--line); }
@@ -187,6 +187,10 @@ select:hover, input:hover { border-color: var(--faint); }
 .b-approve { background: var(--approve-bg); color: var(--approve); }
 .b-review { background: var(--review-bg); color: var(--review); }
 .b-decline { background: var(--decline-bg); color: var(--decline); }
+.t-dec { display: inline-flex; align-items: center; gap: 6px; }
+.rule-tag { font-size: 10.5px; font-family: var(--mono); color: var(--ink-2); border: 1px solid var(--line-2); border-radius: 3px; padding: 1px 5px; }
+.rule-note { font-size: 12.5px; color: var(--ink-2); background: var(--hover); border: 1px solid var(--line); border-radius: var(--radius); padding: 9px 11px; margin-bottom: 8px; }
+.rule-note strong { font-weight: 500; color: var(--ink); }
 .chev { color: var(--faint); transition: transform 150ms; font-size: 12px; }
 .row.open .chev { transform: rotate(90deg); }
 

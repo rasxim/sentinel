@@ -172,6 +172,13 @@ function addRow(txn, merchant, out) {
       h("span", { class: "w", title: "SHAP contribution in log-odds" }, (up ? "+" : "") + r.contribution.toFixed(2)));
   }));
 
+  const title = (s) => s[0] + s.slice(1).toLowerCase();
+  const ruleNote = out.rule && h("div", { class: "rule-note" },
+    h("strong", {}, `Rule: ${title(out.rule.decision)}. `),
+    `This charge is ${fixed(out.rule.amount_ratio, 1)}× usual spend, beyond the ${fixed(out.rule.training_max, 1)}× ` +
+    "range the model was trained on. Tree models can't extrapolate past their training data, so a rule " +
+    `decides instead. The model alone scored ${prob(out.fraud_probability)} (${out.model_decision.toLowerCase()}).`);
+
   const top = new Set(out.reasons.map((r) => r.feature));
   const feats = h("dl", { class: "featgrid" }, Object.entries(out.features).map(([k, v]) => [
     h("dt", { class: top.has(k) ? "hl" : null }, k),
@@ -195,11 +202,14 @@ function addRow(txn, merchant, out) {
       h("span", { class: "t-risk" },
         h("span", { class: "bar-wrap" }, zones),
         h("span", { class: "p" }, `p ${prob(out.fraud_probability)}`)),
-      h("span", {}, h("span", { class: `badge b-${d}` }, out.decision[0] + out.decision.slice(1).toLowerCase())),
+      h("span", { class: "t-dec" },
+        h("span", { class: `badge b-${d}` }, title(out.decision)),
+        out.rule && h("span", { class: "rule-tag", title: "Decided by the out-of-range amount rule" }, "Rule")),
       h("span", { class: "chev", "aria-hidden": "true" }, "▸")),
     h("div", { class: "detail" },
       h("div", {},
         h("h3", {}, "Why this decision"),
+        ruleNote,
         reasons,
         h("p", { class: "detail-note" },
           `Scored against ${plural(out.history_used, "earlier transaction")} in ${out.latency_ms} ms. ` +

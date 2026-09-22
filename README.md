@@ -16,7 +16,7 @@ accuracy.
 | **Features** | 16 point-in-time behavioural features |
 | **Model** | XGBoost — **PR-AUC 0.895** vs 0.755 logistic-regression baseline, 0.008 no-skill |
 | **Leakage control** | label shuffle collapses PR-AUC to **0.012**, the no-skill level |
-| **Policy** | cost-optimised thresholds cut modelled loss **52%** vs a default 0.5 cut-off |
+| **Policy** | cost-optimised thresholds cut modelled loss **52%** vs a default 0.5 cut-off, plus a guardrail rule for amounts beyond the training range |
 | **Serving** | ~14 ms median, 17 ms p95 per decision, with an offline/online feature parity test |
 | **Validation** | adversarial probes found and fixed a data-generation leak — see below |
 | **Console** | browser UI with live scenarios and per-decision SHAP explanations |
@@ -289,6 +289,39 @@ Headline PR-AUC fell from 0.961 to 0.895, and account-takeover recall from 72% t
 earlier figures were inflated by the leak; the current ones reflect what the features actually
 support.
 
+### Amounts outside the training range
+
+A second round of probing found a $20,000 charge — 841× the account's usual spend — **approved**
+at one of its regular stores, and at an unfamiliar store the score froze at 0.145 for every amount
+from $500 upward.
+
+This is a property of tree models rather than a bug in the pipeline: they cannot extrapolate. The
+largest `amount_ratio` in the training data is 12.75×, and every value above that falls into the
+same leaves, so $500 and $20,000 are indistinguishable to the model.
+
+The first attempt was a **monotonic constraint** telling XGBoost that a larger amount may never
+lower the risk. It made things worse — PR-AUC fell from 0.895 to 0.865 and account-takeover recall
+from 57% to 44% — because fraud risk is U-shaped in amount: tiny charges are card testing and
+large ones are takeover, and a monotone function cannot represent a U. It was reverted.
+
+What shipped instead is a **guardrail rule** in the service, layered on top of the model:
+
+| `amount_ratio` | decision |
+|---|---|
+| up to 12.75× (inside the training range) | the model decides |
+| above 12.75× | at least REVIEW — the model has no evidence here |
+| above 38.3× (3× the training range) | DECLINE |
+
+The rule can only make a decision stricter, never looser, and the console labels any decision the
+rule changed and shows what the model alone would have said. It touches **1 of 37,846** test-set
+transactions, so the evaluation figures above are unaffected.
+
+The per-decision explanations also surfaced a subtler artifact. On that $20,000 charge, the model
+counted "182× its largest purchase so far" as *lowering* the risk. In the generated data, takeover
+fraud was capped at about 2.8× an account's largest prior purchase, so the only transactions that
+ever far exceeded it were rare legitimate splurges — and the model learned that. It is covered for
+extreme amounts by the rule, and listed under limitations below.
+
 ---
 
 ## Design trade-offs
@@ -300,6 +333,7 @@ support.
 | In-memory history per account, loaded from SQLite on first use | no database round trip after the first request, and bursts build live | held in one process: lost on restart and not shared across replicas; years of history would need running aggregates instead of full lists |
 | Two feature implementations | serving cannot use a batch pandas pass | requires a parity test to stay honest |
 | Logistic regression kept as a baseline | makes the gradient-boosted gain measurable rather than assumed | — |
+| A rule for amounts outside the training range | tree models cannot extrapolate, so the model has no evidence past 12.75× usual spend | the review and decline cut-offs for the rule are set by hand from the training range, not learned |
 
 ## Limitations
 
@@ -316,9 +350,12 @@ Specifically:
   data.
 - The cost figures ($200 / $50, plus $5 per human review) are assumptions. They are the right
   *kind* of input for this decision, but the specific values are illustrative.
-- Tree models do not extrapolate. Account takeover was planted at 1.5–8× typical spend, so a
-  charge at 20× or 80× lands in the same bucket as 8× — it is sent to review, not declined.
-  Real training data with a wider range, or an explicit amount rule layered on top, would fix it.
+- Takeover fraud in the generated data only ever happens at merchants the account has never used,
+  and never far above the account's largest purchase. So inside the training range, a large charge
+  at a *regular* store is trusted — up to 12.75× usual spend it can be approved — and exceeding an
+  account's previous maximum reads as a legitimate splurge. Beyond 12.75× the guardrail takes over.
+  Planting takeover fraud at familiar merchants and with a wider amount range would teach the model
+  both cases directly.
 
 ---
 

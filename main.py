@@ -30,6 +30,16 @@ FEATURE_NAMES = bundle["features"]
 BOOSTER = MODEL.get_booster()
 print("loaded model with features:", FEATURE_NAMES)
 
+# Guardrail for amounts outside the training range. A tree model cannot
+# extrapolate: every amount_ratio above the largest one it trained on falls into
+# the same leaves, so $500 and $20,000 get identical scores. Past that point the
+# model has no evidence either way, so a rule decides instead - a human looks at
+# it, and far past it the charge is blocked.
+AMOUNT_RATIO_MAX = bundle["amount_ratio_max"]
+RULE_REVIEW_RATIO = AMOUNT_RATIO_MAX
+RULE_DECLINE_RATIO = 3 * AMOUNT_RATIO_MAX
+SEVERITY = {"APPROVE": 0, "REVIEW": 1, "DECLINE": 2}
+
 # Thresholds come from the sweep in cost_curve.py, not from taste. 0.5 is a
 # statistical midpoint; these are where expected cost is actually lowest given
 # $200 per missed fraud and $50 per false decline.
@@ -230,6 +240,22 @@ def compute_features(txn, typical_amount, home_lat, home_lon, history):
     }
 
 
+def amount_rule(amount_ratio):
+    """The out-of-range amount guardrail, or None if the amount is in range."""
+    if amount_ratio > RULE_DECLINE_RATIO:
+        decision = "DECLINE"
+    elif amount_ratio > RULE_REVIEW_RATIO:
+        decision = "REVIEW"
+    else:
+        return None
+    return {
+        "name": "amount_outside_training_range",
+        "decision": decision,
+        "amount_ratio": round(amount_ratio, 2),
+        "training_max": round(AMOUNT_RATIO_MAX, 2),
+    }
+
+
 def explain(X, top=3):
     """The features that moved this score the most, from the model itself.
 
@@ -307,7 +333,9 @@ def root():
 @app.get("/meta")
 def meta():
     return {"model": "XGBoost", "n_features": len(FEATURE_NAMES),
-            "review_threshold": REVIEW_THRESHOLD, "decline_threshold": DECLINE_THRESHOLD}
+            "review_threshold": REVIEW_THRESHOLD, "decline_threshold": DECLINE_THRESHOLD,
+            "rule_review_ratio": round(RULE_REVIEW_RATIO, 2),
+            "rule_decline_ratio": round(RULE_DECLINE_RATIO, 2)}
 
 
 @app.get("/accounts")
@@ -404,11 +432,18 @@ def score_transaction(txn: TransactionIn):
     reasons = explain(X)
 
     if fraud_probability >= DECLINE_THRESHOLD:
-        decision = "DECLINE"
+        model_decision = "DECLINE"
     elif fraud_probability >= REVIEW_THRESHOLD:
-        decision = "REVIEW"
+        model_decision = "REVIEW"
     else:
-        decision = "APPROVE"
+        model_decision = "APPROVE"
+
+    rule = amount_rule(feats["amount_ratio"])
+    decision = model_decision
+    if rule and SEVERITY[rule["decision"]] > SEVERITY[model_decision]:
+        decision = rule["decision"]
+    else:
+        rule = None   # only report a rule when it actually changed the outcome
 
     record = Decision(
         txn_id=txn.txn_id,
@@ -437,6 +472,8 @@ def score_transaction(txn: TransactionIn):
 
     return {
         "decision": decision,
+        "model_decision": model_decision,
+        "rule": rule,
         "fraud_probability": round(fraud_probability, 6),
         "history_used": len(history),
         "added_to_history": added,
