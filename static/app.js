@@ -439,9 +439,20 @@ async function boot() {
     document.querySelector(".legend .scale").replaceChildren(...zoneSpans());
     $("account-select").replaceChildren(...accounts.map((a) => h("option", { value: a.account_id },
       `${a.home_city} · ${a.account_id}`)));
-    const start = accounts.find((a) => a.account_id === "ACC00042") || accounts[0];
+    // Shareable links: ?scenario=burst runs a scenario on arrival, &expand opens
+    // its latest decision, &account=ACC00005 picks the account.
+    const params = new URLSearchParams(location.search);
+    const wanted = accounts.find((a) => a.account_id === params.get("account"));
+    const start = wanted || accounts.find((a) => a.account_id === "ACC00042") || accounts[0];
     $("account-select").value = start.account_id;
     await loadAccount(start.account_id);
+
+    const SCENARIO_KEYS = { everyday: 0, burst: 1, travel: 2, takeover: 3 };
+    const key = params.get("scenario");
+    if (key in SCENARIO_KEYS) {
+      await runScenario(SCENARIO_KEYS[key]);
+      if (params.has("expand")) document.querySelector("#feed .row .row-main")?.click();
+    }
   } catch (err) {
     toast(`Couldn't reach the scoring service: ${err.message}`);
   }

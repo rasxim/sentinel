@@ -1,409 +1,239 @@
-# Sentinel — Real-Time Card Fraud Detection
+# Sentinel
 
-**[Live demo → sentinel-pm60.onrender.com](https://sentinel-pm60.onrender.com)** — runs on a free
-tier, so the first visit after a quiet spell takes about a minute to wake up.
+**Real-time card fraud detection: a scoring service that decides approve, review, or decline in about 14 ms, and shows why.**
 
-A backend scoring service that evaluates card transactions in real time and routes each one to
-`APPROVE`, `REVIEW`, or `DECLINE`. Built end to end: a transaction simulator, a point-in-time
-feature pipeline, a model selection process, cost-based threshold selection, and a FastAPI
-service that scores a live transaction in about 14 ms.
+[**Live demo**](https://sentinel-pm60.onrender.com) ·
+[**Watch a card-testing attack get caught**](https://sentinel-pm60.onrender.com/?scenario=burst&expand) ·
+[How it works](#how-it-works) ·
+[Run locally](#run-locally)
 
-The focus is on the parts of a fraud system that are easy to get quietly wrong — target
-leakage, threshold choice, and training/serving consistency — rather than on squeezing out
-accuracy.
+![Sentinel console scoring a card-testing burst](docs/console.png)
 
-| | |
+<sub>A card-testing burst: five tiny online charges a minute apart. The first goes to review; as the
+pattern emerges, the next four are declined. The expanded row shows the model's own reasons.
+The demo runs on a free tier, so the first visit after a quiet spell takes about a minute to wake up.</sub>
+
+---
+
+## Highlights
+
+- **End-to-end system**, not a notebook: transaction simulator → point-in-time feature pipeline →
+  model training and selection → cost-based decision policy → FastAPI service → browser console, deployed.
+- **Leakage-proof features.** All 16 features are built only from an account's *prior* transactions,
+  with a time-based train/test split. A label-shuffle control confirms it: PR-AUC drops from
+  **0.895 to 0.012**, the level of random guessing.
+- **Thresholds chosen by business cost, not by default.** Sweeping cut-offs against asymmetric costs
+  ($200 per missed fraud, $50 per wrongly declined customer) cuts modelled loss by **52%** compared
+  with the usual 0.5 threshold.
+- **Training/serving consistency.** Features are computed two different ways, in batch for training
+  and live for serving, and a parity test checks that they agree on **3,216 of 3,216** values.
+- **Explainable decisions.** Every decision lists its top reasons, taken from the model's exact
+  SHAP contributions rather than hand-written text.
+- **Tested adversarially.** Probing the live service with hand-built transactions found two real
+  failure modes, both fixed and documented [below](#validation).
+
+## Results
+
+Evaluated on the final 20% of the timeline: 37,846 transactions, 288 of them fraud (0.76%).
+
+| model | PR-AUC |
 |---|---|
-| **Data** | 189,230 transactions · 2,000 accounts · 300 merchants · 90 days |
-| **Fraud rate** | 0.66% (1,255 transactions across 3 typologies) |
-| **Features** | 16 point-in-time behavioural features |
-| **Model** | XGBoost — **PR-AUC 0.895** vs 0.755 logistic-regression baseline, 0.008 no-skill |
-| **Leakage control** | label shuffle collapses PR-AUC to **0.012**, the no-skill level |
-| **Policy** | cost-optimised thresholds cut modelled loss **52%** vs a default 0.5 cut-off, plus a guardrail rule for amounts beyond the training range |
-| **Serving** | ~14 ms median, 17 ms p95 per decision, with an offline/online feature parity test |
-| **Validation** | adversarial probes found and fixed a data-generation leak — see below |
-| **Console** | browser UI with live scenarios and per-decision SHAP explanations |
+| random guessing (the fraud rate) | 0.008 |
+| logistic regression (baseline) | 0.755 |
+| **XGBoost** | **0.895** |
+| XGBoost trained on shuffled labels (leakage control) | 0.012 |
 
----
-
-## Architecture
-
-```
-  generate_data.py                                  ┌────────────────┐
-  (synthetic world) ──────────────────────────────► │  sentinel.db   │
-                                                    │    (SQLite)    │
-                          ┌───── account history ───┤                │
-                          │                         └────────▲───────┘
-                          ▼                                  │
-  POST /score      ┌──────────────────────┐                  │
-  {transaction} ──►│   FastAPI service    │                  │
-                   │  1. load history     │                  │
-                   │  2. compute 16 feats │──► model.joblib  │
-                   │  3. score            │    (XGBoost)     │
-                   │  4. apply policy     │                  │
-                   └──────────┬───────────┘─── decision ─────┘
-                              ▼
-              APPROVE  <0.05    REVIEW  0.05–0.85    DECLINE  ≥0.85
-```
-
-A request arrives carrying one transaction and no history. The service loads that account's
-prior transactions under a strict as-of cutoff, computes 16 behavioural features live, scores
-them, applies a cost-optimised policy, and persists the decision.
-
----
-
-## 1. The data
-
-The dataset is generated rather than downloaded. That was a deliberate trade: public card-fraud
-datasets are PCA-anonymised, with no account identity, no merchant, and no usable timestamp —
-which makes point-in-time feature engineering impossible and leaves nothing to verify a leakage
-control against. Generating the world gives every transaction an account, a merchant, a
-location, a time, **and a known ground-truth label**, which is what makes the rest of this
-project testable.
-
-`generate_data.py` builds 2,000 accounts and 300 merchants across 8 US cities, producing
-189,230 transactions over 90 days. Each account has a per-account baseline spend, five
-preferred merchants it uses 80% of the time, and lognormally distributed amounts. A quarter of
-accounts take one multi-day trip to another city — so distance from home is deliberately *not*
-a reliable fraud signal, and the model has to learn implied speed instead.
-
-![Class balance and fraud typologies](docs/chart_data.png)
-
-Three fraud typologies are planted, totalling 1,255 transactions:
-
-| pattern | accounts | txns | how it is constructed | intended signal |
-|---|---|---|---|---|
-| **card testing** | 60 | 731 | 6–20 charges of $0.50–$12 inside 5–40 minutes, at unrelated local merchants, mostly card-not-present | burst rate, merchant diversity |
-| **impossible travel** | 80 | 239 | 2–4 card-present charges in a different city, 20–90 minutes after a genuine transaction | distance ÷ elapsed time |
-| **account takeover** | 50 | 285 | 3–8 charges at 1.5–8× the account's norm, at never-used merchants in its home city | amount deviation + merchant novelty |
-
-Every pattern is built to **overlap with legitimate behaviour**. Fraud amounts sit inside normal
-spending ranges, the impossible-travel city pairs run from blatant (coast to coast) to plausible
-(a regional hop), and the 20% non-favourite rule means real customers also shop somewhere new.
-Without that overlap a single `WHERE` clause would separate fraud perfectly and the model would
-be decorative.
-
-Each pattern leaves a distinct fingerprint in the features:
-
-![Feature signatures by fraud type](docs/chart_signatures.png)
-
----
-
-## 2. Feature engineering
-
-Sixteen features, each computed **only from an account's prior transactions**:
-
-| group | features | targets |
+| fraud pattern | caught (p ≥ 0.5) | caught or sent to review |
 |---|---|---|
-| transaction | `amount`, `card_present`, `hour` | — |
-| amount deviation | `amount_ratio`, `amount_vs_hist_mean`, `amount_vs_hist_max` | account takeover |
-| velocity | `secs_since_last`, `txn_count_1h`, `txn_count_24h`, `distinct_merchants_1h` | card testing |
-| location | `dist_from_last_km`, `implied_speed_kmh`, `dist_from_home_km` | impossible travel |
-| merchant familiarity | `merchant_seen_before`, `merchant_use_count`, `distinct_merchants_30d` | account takeover |
+| card testing | 94% | 96% |
+| impossible travel | 72% | 96% |
+| account takeover | 57% | 80% |
+| **false positive rate** | **0.04%** | |
 
-Features are ratios and counts relative to each account rather than raw values, so the model
-never learns anything about a *specific* customer. It learns that a charge several times an
-account's own baseline at a merchant that account has never used is suspicious — a rule that
-holds equally for a $12/day customer and a $200/day one. A consequence worth noting: a brand-new
-account can be scored immediately, with no retraining.
+<p align="center"><img src="docs/chart_pr_curve.png" width="560" alt="Precision-recall curves for XGBoost, logistic regression and the shuffled-label control"></p>
 
-### Leakage control
+**Why PR-AUC and not accuracy?** Only 1 transaction in 131 is fraud, so a model that always answers
+"not fraud" is 99.2% accurate and completely useless. PR-AUC measures how well the model ranks the
+rare fraud cases above everything else, and it penalises false alarms properly at this level of
+imbalance. ROC-AUC would look flattering here for the same reason.
 
-The loop computes features from accumulated history, then appends the current transaction — so
-a transaction structurally cannot contribute to its own features. The train/test split is by
-time, never random: the first 80% of the timeline trains, the last 20% tests.
+## How it works
 
-This is verified, not asserted. Inside a card-testing burst:
+```mermaid
+flowchart LR
+    G[Transaction simulator<br/>189k transactions] --> DB[(SQLite)]
+    DB --> F[Feature pipeline<br/>16 point-in-time features]
+    F --> T[Training<br/>logistic regression vs XGBoost]
+    T --> M[model.joblib]
+    R[POST /score] --> S[FastAPI service]
+    DB --> S
+    M --> S
+    S --> P{Cost-based policy<br/>+ guardrail rule}
+    P --> A[Approve / Review / Decline<br/>with SHAP reasons]
+```
 
-| | mean `txn_count_1h` |
-|---|---|
-| first transaction of a burst | 0.07 |
-| later transactions in the same burst | 6.91 |
-| ordinary legitimate transaction | 0.05 |
+### 1. Data
 
-The first charge of a 20-charge burst sees exactly as much history as a normal transaction —
-none of its own burst. A leaking implementation would show 7–20 there.
+Public card-fraud datasets are anonymised into principal components, with no account, merchant,
+time or location. That makes behavioural features impossible to build. So Sentinel generates its
+own world: **2,000 accounts** and **300 merchants** across 8 US cities, with **189,230 transactions
+over 90 days**. Each account has its own typical spend, five regular stores it uses 80% of the time,
+and occasional trips to other cities.
 
-A consequence worth stating plainly: **the model cannot flag the first charge of a burst on
-velocity features**, because at that moment nothing distinguishes it. Detection begins at the
-second transaction. That is how real fraud detection behaves too.
+Three fraud patterns are planted (1,255 transactions, 0.66%), each deliberately built to overlap
+with normal behaviour so that no single rule can separate them:
 
----
-
-## 3. Model selection
-
-A logistic regression baseline was built first, deliberately, so the gradient-boosted model had
-something to beat. Both are evaluated on the final 20% of the timeline — 37,846 transactions,
-288 of them fraud (0.76%).
-
-| model | PR-AUC | vs. no-skill |
+| pattern | what happens | what gives it away |
 |---|---|---|
-| no-skill (test fraud rate) | 0.0076 | 1× |
-| logistic regression | 0.7554 | 99× |
-| **XGBoost** | **0.8951** | **118×** |
-| XGBoost, labels shuffled | 0.0122 | ≈ no-skill |
+| **card testing** | 6–20 tiny online charges within minutes at unfamiliar stores | burst rate, many merchants per hour |
+| **impossible travel** | a purchase in another city 20–90 minutes after a genuine one | distance ÷ time since last purchase |
+| **account takeover** | 3–8 purchases at 1.5–8× normal spend at never-used stores | amount vs. the account's norm, unfamiliar merchant |
 
-![Precision-recall curves](docs/chart_pr_curve.png)
+<p align="center"><img src="docs/chart_signatures.png" width="820" alt="Each fraud pattern's signature in the features"></p>
 
-**Accuracy is not reported.** Fraud is 1 in 131 transactions here, so a model that always
-answers "not fraud" scores 99.2%. **ROC-AUC is also omitted** — its denominator is dominated by
-the 37,558 legitimate rows, so flagging dozens of innocent customers barely moves it. PR-AUC is
-the metric that penalises false positives proportionally at this level of imbalance.
+### 2. Features without leakage
 
-**XGBoost beat the baseline by 1.18×.** That is a modest gain, and worth stating honestly: the
-signal here is largely linear-separable, so a simple model captures most of it. The gain comes
-from interactions a weighted sum cannot express — a large amount is unremarkable at a familiar
-merchant and suspicious at a new one, and only a tree can represent that conditionally.
+Every feature describes a transaction *relative to that account's own history*, such as spend
+compared with its usual amount, transactions in the past hour, implied travel speed, or whether it
+has used this merchant before. The model never learns anything about specific customers, so a
+brand-new account can be scored immediately.
 
-**The red line is the important one.** Shuffling the training labels destroys the relationship
-between features and outcome; retraining then collapses PR-AUC from 0.8951 to 0.0122 — effectively
-the no-skill line (0.0076). If leakage existed, the model would still find signal there. It finds none.
+Each feature is computed only from transactions **strictly before** the one being scored, and the
+data is split by time (first 80% trains, last 20% tests), never randomly. This is verified rather
+than assumed: the first charge of a card-testing burst sees 0.07 prior transactions in the past
+hour, the same as a normal purchase, while later charges see 6.9. A leaking pipeline would let the
+first charge see its own burst.
 
-![Feature importance](docs/chart_importance.png)
+### 3. Model selection
 
-`distinct_merchants_1h` dominates because card testing is 58% of all fraud and that feature is
-its fingerprint.
+Logistic regression was trained first as a baseline, so XGBoost's gain would be measured rather
+than assumed. XGBoost improves PR-AUC from 0.755 to 0.895, mainly by capturing **interactions** a
+linear model cannot represent: a large purchase is normal at a store the customer uses every week,
+and suspicious at one they have never visited.
 
----
+### 4. Choosing the thresholds
 
-## 4. Choosing the threshold
+The model outputs a probability, and turning it into a decision needs a cut-off. Because a missed
+fraud costs 4× a false decline, the cheapest single threshold is **0.11**, not 0.5:
 
-The model outputs a probability; turning it into a decision needs a cut-off, and 0.5 is an
-arbitrary one — it is the midpoint of a number between 0 and 1, and knows nothing about the
-business. The two error types do not cost the same:
+<p align="center"><img src="docs/cost_curve.png" width="620" alt="Expected cost against decision threshold"></p>
 
-- missed fraud ≈ **$200** — the transaction is written off
-- false decline ≈ **$50** — support contact, customer friction, churn risk
+Two thresholds then give a three-way policy, so that uncertain cases go to a person instead of
+being blocked or waved through:
 
-Sweeping the threshold from 0.01 to 0.99 and computing `(missed × 200) + (false_declines × 50)`:
-
-![Cost curve](docs/cost_curve.png)
-
-| threshold | missed fraud | false declines | cost |
+| decision | probability | transactions | outcome |
 |---|---|---|---|
-| 0.50 (default) | 77 | 16 | $16,200 |
-| **0.11 (cost-optimal)** | 44 | 60 | **$11,800** |
+| APPROVE | below 0.05 | 37,478 | 33 frauds missed |
+| REVIEW | 0.05 – 0.85 | 179 (0.5% of volume) | 71 frauds caught by an analyst |
+| DECLINE | 0.85 and above | 189 | only 5 legitimate customers blocked |
 
-The optimum sits at 0.11 because missed fraud costs 4× a false decline — it is worth wrongly
-declining several customers to prevent one loss. Defaulting to 0.5 costs $4,400 on this test set
-for no benefit. Note also that the curve is **asymmetric**: being too aggressive is cheap, being
-too lax is expensive.
+Total modelled cost is **$7,745, against $16,200** at a fixed 0.5 threshold.
 
-Extending to two thresholds gives the three-way policy:
+### 5. Real-time serving
 
-![Where transactions go under the policy](docs/chart_policy.png)
+A live request carries a single transaction and no history, so the service rebuilds the 16
+features on the fly. Each account's history is loaded from SQLite once and then kept in memory,
+and every scored transaction is appended, so a burst builds on itself exactly as in the demo. Each
+visitor gets an isolated history, so people using the demo at the same time never affect each
+other.
 
-```
-APPROVE   p < 0.05        37,478 transactions    33 frauds missed
-REVIEW    0.05 ≤ p < 0.85    179 transactions    71 frauds caught, 108 false alarms
-DECLINE   p ≥ 0.85           189 transactions     5 legitimate customers blocked
-```
+Because training and serving compute features in two different ways, `test_parity.py` checks that
+they agree on every value for a sample covering all three fraud patterns. Median latency is
+**14 ms** (p95 17 ms).
 
-Total modelled cost **$7,745**, against $16,200 at a fixed 0.5 cut-off — a **52.2% reduction**.
-The review queue is 0.47% of volume, a realistic analyst workload, and hard declines are
-reserved for near-certainty. A two-way system would have to either block those 179 ambiguous
-transactions or let them all through; the middle bucket exists precisely because the model is
-legitimately uncertain about them.
+Two layers sit on top of the model:
 
-Detection rate by pattern:
+- **Explanations.** XGBoost's `pred_contribs` returns each feature's exact contribution to a
+  score. The top three are shown as plain-English reasons for every decision.
+- **A guardrail rule.** Tree models cannot extrapolate beyond the values they were trained on, so
+  amounts above 12.75× an account's usual spend (the largest seen in training) go to review, and
+  above 38× are declined. The rule can only make a decision stricter.
 
-| pattern | recall at `p ≥ 0.5` | sent to at least REVIEW |
-|---|---|---|
-| card testing | 94.3% | 96.2% |
-| impossible travel | 72.0% | 96.0% |
-| account takeover | 56.8% | 79.5% |
-| false positive rate | 0.043% | — |
+## Validation
 
-That ordering tracks how much signal each pattern was designed to leave, and account takeover is
-hardest because it was deliberately built to overlap with normal spending.
+Beyond the metrics, the service was probed with hand-built transactions, changing one variable at a
+time. This found two problems that aggregate scores had hidden:
 
----
-
-## 5. Serving
-
-`POST /score` takes a single transaction and returns a decision. The interesting problem is that
-a live request carries **no history** — `txn_count_1h`, `dist_from_last_km` and
-`merchant_use_count` are not in the request body and must be reconstructed at decision time.
-
-The service keeps an **in-memory history per account**. The first request for an account loads
-its full history from SQLite; after that, every scored transaction is appended in memory, so a
-burst builds on itself — the third charge of a card-testing burst sees the first two. Reads use
-the same as-of cutoff as training: only transactions strictly earlier than the one being scored.
-Scored transactions are never written back to the `transactions` table, which stays the
-untouched training set, and `POST /reset` discards live additions.
-
-A made-up four-charge burst against one account, sent over HTTP:
-
-```
-charge 1   $3.10   txn_count_1h=0   p=0.514   REVIEW
-charge 2   $1.25   txn_count_1h=1   p=0.993   DECLINE
-charge 3   $7.80   txn_count_1h=2   p=0.980   DECLINE
-charge 4   $2.40   txn_count_1h=3   p=0.982   DECLINE
-```
-
-Training computes features in one pandas pass over 189,230 rows. Serving computes them for one
-transaction against that in-memory history. **Two implementations of the same sixteen
-definitions**, and if they drift apart nothing fails loudly — the model is simply served inputs
-that no longer match what it was trained on, and quietly gets worse.
-
-`test_parity.py` guards both halves. It compares every feature value against the offline output
-for a stratified sample covering all three fraud typologies and an account's first-ever
-transaction, and it checks that the in-memory history returns exactly the rows the SQL query
-would:
-
-```
-compared 3,216 values across 201 transactions
-compared live vs SQL history for 201 transactions, 0 mismatch(es)
-PASS - offline and online agree on every feature
-```
-
-Transactions are indexed on `(account_id, ts)` — equality column first, range column second —
-matching the query used to load an account's history.
-
----
-
-## Validation: adversarial testing
-
-Aggregate metrics can look healthy while the model has learned the wrong thing, so the service
-was also probed by hand with constructed transactions against a single account (typical spend
-$23.78, Chicago), changing one variable at a time.
-
-That testing found a real defect. A $2,000 charge — 84× the account's norm — at a merchant it had
-never used was **approved**, and the score did not move between $500 and $2,000.
-
-The cause was in the data generator, not the model. Account-takeover fraud had been drawing its
-"unfamiliar" merchants from all eight cities, so 63% of it happened far from home. The model had
-learned *"large amount + new merchant + far away"* rather than the intended *"large amount + new
-merchant"*, and a local takeover slipped through. Card testing had the same flaw in milder form:
-its occasional card-present charges jumped across the country between swipes.
-
-Both patterns now draw merchants from the account's home city, and the pipeline was rebuilt from
-scratch. The same probes, before and after:
-
-| probe (same account, at home, merchant never used) | before | after |
-|---|---|---|
-| $150 (6.3× typical) | 0.032 — approve | **0.219 — review** |
-| $2,000 (84× typical) | 0.026 — approve | **0.145 — review** |
-| $150 at a favourite merchant *(control)* | — | 0.0001 — approve |
-| Seattle 30 minutes after a Chicago purchase *(control)* | — | 0.955 — decline |
-| Seattle 16 hours later *(plausible flight)* | — | 0.0003 — approve |
-
-Headline PR-AUC fell from 0.961 to 0.895, and account-takeover recall from 72% to 57%. Both
-earlier figures were inflated by the leak; the current ones reflect what the features actually
-support.
-
-### Amounts outside the training range
-
-A second round of probing found a $20,000 charge — 841× the account's usual spend — **approved**
-at one of its regular stores, and at an unfamiliar store the score froze at 0.145 for every amount
-from $500 upward.
-
-This is a property of tree models rather than a bug in the pipeline: they cannot extrapolate. The
-largest `amount_ratio` in the training data is 12.75×, and every value above that falls into the
-same leaves, so $500 and $20,000 are indistinguishable to the model.
-
-The first attempt was a **monotonic constraint** telling XGBoost that a larger amount may never
-lower the risk. It made things worse — PR-AUC fell from 0.895 to 0.865 and account-takeover recall
-from 57% to 44% — because fraud risk is U-shaped in amount: tiny charges are card testing and
-large ones are takeover, and a monotone function cannot represent a U. It was reverted.
-
-What shipped instead is a **guardrail rule** in the service, layered on top of the model:
-
-| `amount_ratio` | decision |
-|---|---|
-| up to 12.75× (inside the training range) | the model decides |
-| above 12.75× | at least REVIEW — the model has no evidence here |
-| above 38.3× (3× the training range) | DECLINE |
-
-The rule can only make a decision stricter, never looser, and the console labels any decision the
-rule changed and shows what the model alone would have said. It touches **1 of 37,846** test-set
-transactions, so the evaluation figures above are unaffected.
-
-The per-decision explanations also surfaced a subtler artifact. On that $20,000 charge, the model
-counted "182× its largest purchase so far" as *lowering* the risk. In the generated data, takeover
-fraud was capped at about 2.8× an account's largest prior purchase, so the only transactions that
-ever far exceeded it were rare legitimate splurges — and the model learned that. It is covered for
-extreme amounts by the rule, and listed under limitations below.
-
----
-
-## Design trade-offs
-
-| decision | why | what it costs |
-|---|---|---|
-| Synthetic data over a public dataset | keeps account, merchant, time and location, so point-in-time features and a leakage control are possible | accuracy figures describe the pipeline, not real-world fraud |
-| SQLite over Postgres | real SQL, zero setup, and it sits behind SQLAlchemy so the swap is a config line | not suitable for concurrent production write load |
-| In-memory history per account, loaded from SQLite on first use | no database round trip after the first request, and bursts build live | held in one process: lost on restart and not shared across replicas; years of history would need running aggregates instead of full lists |
-| Two feature implementations | serving cannot use a batch pandas pass | requires a parity test to stay honest |
-| Logistic regression kept as a baseline | makes the gradient-boosted gain measurable rather than assumed | — |
-| A rule for amounts outside the training range | tree models cannot extrapolate, so the model has no evidence past 12.75× usual spend | the review and decline cut-offs for the rule are set by hand from the training range, not learned |
+1. **A leak in the simulator.** Account-takeover fraud had been drawing merchants from every city,
+   so the model learned "far from home" instead of "unusual amount at an unfamiliar store", and a
+   $150 charge (6× usual spend) at a never-used local shop was approved. After the generator was
+   fixed, the same charge goes to review. PR-AUC fell from 0.961 to 0.895, the honest figure once
+   the shortcut was removed.
+2. **No extrapolation.** A $20,000 charge scored the same as a $500 one, because no training
+   example went that high. A monotonic constraint was tried first and made results worse (fraud
+   risk is U-shaped in amount: tiny charges are card testing, huge ones are takeover), so the
+   guardrail rule above was added instead. It affects 1 in 37,846 test transactions.
 
 ## Limitations
 
-**Because the data is synthetic, the model can only recover patterns I generated — the accuracy
-figures bound what the pipeline can do, not what it would do on real card data. What the project
-demonstrates is the pipeline itself: point-in-time feature construction, leakage control,
-baseline comparison, and cost-based threshold selection.**
+- **The data is synthetic.** The model can only recover patterns that were generated, so these
+  figures describe what the pipeline can do, not how it would perform on real card traffic, where
+  fraud adapts and labels arrive weeks late through chargebacks.
+- **The cost figures are assumptions.** $200, $50, and $5 per review are the right kind of input
+  for this decision, but the values are illustrative.
+- **Large charges at regular stores are trusted.** Simulated takeover fraud never uses an account's
+  own stores, so within the training range a big purchase at a familiar merchant can be approved.
+  Planting that case in the simulator would teach the model directly.
+- **The live history lives in one process.** It resets on restart and would need a shared store,
+  such as Redis, to run on several servers.
 
-Specifically:
+## Tech stack
 
-- Real fraud is adversarial and shifts as detection improves. These patterns are static.
-- Real labels arrive late and incompletely, via chargebacks. These are perfect and immediate.
-- The generator's timing and volume constants are hand-tuned estimates, not fitted to real card
-  data.
-- The cost figures ($200 / $50, plus $5 per human review) are assumptions. They are the right
-  *kind* of input for this decision, but the specific values are illustrative.
-- Takeover fraud in the generated data only ever happens at merchants the account has never used,
-  and never far above the account's largest purchase. So inside the training range, a large charge
-  at a *regular* store is trusted — up to 12.75× usual spend it can be approved — and exceeding an
-  account's previous maximum reads as a legitimate splurge. Beyond 12.75× the guardrail takes over.
-  Planting takeover fraud at familiar merchants and with a wider amount range would teach the model
-  both cases directly.
+**Python** · **FastAPI** · **XGBoost** · **scikit-learn** · **pandas** · **SQLAlchemy** · **SQLite** ·
+vanilla **JavaScript** · deployed on **Render**
 
----
-
-## Running it
+## Run locally
 
 ```bash
+git clone https://github.com/rasxim/sentinel.git && cd sentinel
 pip install -r requirements.txt
 
-python init_db.py          # create tables
-python generate_data.py    # 189k synthetic transactions   (~1 min)
-python features.py         # build the feature table       (~3 min)
-python train.py            # baseline, model, shuffle control
-python cost_curve.py       # threshold sweep + cost_curve.png
-python test_parity.py      # offline/online feature parity
-python make_charts.py      # regenerate README figures
-
-uvicorn main:app
+python init_db.py && python generate_data.py   # build the synthetic world  (~1 min)
+uvicorn main:app                               # open http://127.0.0.1:8000
 ```
 
-Then open **`http://127.0.0.1:8000`** for the scoring console, or `/docs` for the raw API.
-
-The console picks one clean demo account per city and lets you run four scenarios — an everyday
-purchase, a card-testing burst, impossible travel, and account takeover — or compose your own
-transaction. Each decision expands to show its three strongest reasons, taken from the model's
-own SHAP contributions (XGBoost `pred_contribs`), alongside all sixteen feature values. A
-simulated clock starts the morning after the account's last real purchase and advances with each
-transaction, which is what lets a burst or an impossible trip play out in real time.
+`model.joblib` is committed, so the steps above are enough to run the console. To reproduce the
+training and every figure in this README:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/score \
-  -H "Content-Type: application/json" \
-  -d '{"txn_id":"T1","account_id":"ACC00042","merchant_id":"MER0175",
-       "amount":25.00,"ts":"2026-08-31T12:00:00",
-       "lat":41.9053,"lon":-87.6595,"card_present":true}'
+python features.py      # build the feature table  (~3 min)
+python train.py         # baseline, XGBoost, shuffle control
+python cost_curve.py    # threshold sweep
+python make_charts.py   # figures
+python test_parity.py   # training/serving feature parity
 ```
 
-```json
-{"decision": "APPROVE", "fraud_probability": 0.000002, "history_used": 109, "latency_ms": 13.7}
+<details>
+<summary><b>Project structure</b></summary>
+
+```
+generate_data.py    synthetic accounts, merchants, transactions and planted fraud
+features.py         16 point-in-time features (batch, for training)
+train.py            time-based split, logistic regression, XGBoost, shuffle control
+cost_curve.py       threshold sweep and three-way policy
+main.py             FastAPI service: live features, scoring, rule, explanations, API
+static/             browser console (HTML, CSS, JavaScript)
+test_parity.py      checks that batch and live features agree
+make_charts.py      README figures
+db.py, models.py    SQLAlchemy engine and schema
+render.yaml         deployment config
 ```
 
-`features.csv` and `sentinel.db` are build artifacts and are not committed — the steps above
-regenerate them.
+</details>
+
+<details>
+<summary><b>API</b></summary>
+
+| endpoint | purpose |
+|---|---|
+| `POST /score` | score one transaction and return the decision, probability, reasons and all 16 features |
+| `GET /accounts`, `GET /accounts/{id}` | demo accounts and their profiles |
+| `POST /reset` | clear this visitor's live history |
+| `GET /meta` | thresholds and rule limits |
+| `GET /docs` | interactive API documentation |
+
+</details>
 
 ---
 
-## Stack
-
-Python · FastAPI · SQLAlchemy · SQLite · XGBoost · scikit-learn · pandas · matplotlib
+Built by [@rasxim](https://github.com/rasxim).
