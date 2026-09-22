@@ -1,5 +1,8 @@
 # Sentinel — Real-Time Card Fraud Detection
 
+**[Live demo → sentinel-pm60.onrender.com](https://sentinel-pm60.onrender.com)** — runs on a free
+tier, so the first visit after a quiet spell takes about a minute to wake up.
+
 A backend scoring service that evaluates card transactions in real time and routes each one to
 `APPROVE`, `REVIEW`, or `DECLINE`. Built end to end: a transaction simulator, a point-in-time
 feature pipeline, a model selection process, cost-based threshold selection, and a FastAPI
