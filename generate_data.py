@@ -139,10 +139,18 @@ def make_transactions(accounts, merchants):
 
 def make_card_testing_fraud(accounts, merchants):
     # A stolen card gets probed with a burst of tiny charges to see if it still works.
+    # Merchants stay in the account's home city. Drawing them nationwide made the
+    # few card-present charges jump across the country between swipes, so the
+    # pattern leaked a huge implied speed that is not part of card testing.
+    by_city = {}
+    for m in merchants:
+        by_city.setdefault(m["city"], []).append(m)
+
     fraud_accounts = random.sample(accounts, N_CARD_TESTING_ACCOUNTS)
     rows = []
 
     for acct in fraud_accounts:
+        local = by_city[acct["home_city"]]
         burst_size = random.randint(6, 20)
         window_minutes = random.randint(5, 40)
 
@@ -154,7 +162,7 @@ def make_card_testing_fraud(accounts, merchants):
         )
 
         for _ in range(burst_size):
-            merchant = random.choice(merchants)  # random, not the account's local set
+            merchant = random.choice(local)  # any local merchant, not just favourites
             ts = burst_start + timedelta(seconds=random.uniform(0, window_minutes * 60))
             amount = round(random.uniform(0.50, 12.00), 2)
             card_present = random.random() < 0.10  # "mostly card-not-present"
@@ -248,8 +256,13 @@ def make_account_takeover_fraud(accounts, merchants, txns):
         if not acct_txns:
             continue
 
+        # Never-used merchants in the account's own city only. Drawing them
+        # nationwide put 63% of takeover fraud far from home, and the model learned
+        # "far away" instead of "big amount at an unfamiliar merchant".
         visited_ids = {t["merchant_id"] for t in acct_txns}
-        unfamiliar = [m for m in merchants if m["merchant_id"] not in visited_ids]
+        unfamiliar = [m for m in merchants
+                      if m["merchant_id"] not in visited_ids
+                      and m["city"] == acct["home_city"]]
         if not unfamiliar:
             continue
 

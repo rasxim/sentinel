@@ -23,7 +23,7 @@ print("loaded model with features:", FEATURE_NAMES)
 # statistical midpoint; these are where expected cost is actually lowest given
 # $200 per missed fraud and $50 per false decline.
 REVIEW_THRESHOLD = 0.05
-DECLINE_THRESHOLD = 0.90
+DECLINE_THRESHOLD = 0.85
 
 ONE_HOUR = timedelta(hours=1)
 ONE_DAY = timedelta(days=1)

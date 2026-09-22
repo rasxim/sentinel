@@ -161,7 +161,7 @@ print("saved docs/chart_importance.png")
 
 
 # ------------------------------------------------ 5. what the policy does
-REVIEW_T, DECLINE_T = 0.05, 0.90
+REVIEW_T, DECLINE_T = 0.05, 0.85
 approve = xgb_p < REVIEW_T
 review = (xgb_p >= REVIEW_T) & (xgb_p < DECLINE_T)
 decline = xgb_p >= DECLINE_T
