@@ -221,22 +221,40 @@ hardest because it was deliberately built to overlap with normal spending.
 a live request carries **no history** — `txn_count_1h`, `dist_from_last_km` and
 `merchant_use_count` are not in the request body and must be reconstructed at decision time.
 
+The service keeps an **in-memory history per account**. The first request for an account loads
+its full history from SQLite; after that, every scored transaction is appended in memory, so a
+burst builds on itself — the third charge of a card-testing burst sees the first two. Reads use
+the same as-of cutoff as training: only transactions strictly earlier than the one being scored.
+Scored transactions are never written back to the `transactions` table, which stays the
+untouched training set, and `POST /reset` discards live additions.
+
+A made-up four-charge burst against one account, sent over HTTP:
+
+```
+charge 1   $3.10   txn_count_1h=0   p=0.514   REVIEW
+charge 2   $1.25   txn_count_1h=1   p=0.993   DECLINE
+charge 3   $7.80   txn_count_1h=2   p=0.980   DECLINE
+charge 4   $2.40   txn_count_1h=3   p=0.982   DECLINE
+```
+
 Training computes features in one pandas pass over 189,230 rows. Serving computes them for one
-transaction against history queried from SQLite. **Two implementations of the same sixteen
+transaction against that in-memory history. **Two implementations of the same sixteen
 definitions**, and if they drift apart nothing fails loudly — the model is simply served inputs
 that no longer match what it was trained on, and quietly gets worse.
 
-`test_parity.py` runs a stratified sample through the serving path and compares every value
-against the offline output, covering all three fraud typologies and an account's first-ever
-transaction, where every history-derived feature is undefined:
+`test_parity.py` guards both halves. It compares every feature value against the offline output
+for a stratified sample covering all three fraud typologies and an account's first-ever
+transaction, and it checks that the in-memory history returns exactly the rows the SQL query
+would:
 
 ```
 compared 3,216 values across 201 transactions
+compared live vs SQL history for 201 transactions, 0 mismatch(es)
 PASS - offline and online agree on every feature
 ```
 
 Transactions are indexed on `(account_id, ts)` — equality column first, range column second —
-matching the only query the service issues: *what did this account do before this moment?*
+matching the query used to load an account's history.
 
 ---
 
@@ -278,7 +296,7 @@ support.
 |---|---|---|
 | Synthetic data over a public dataset | keeps account, merchant, time and location, so point-in-time features and a leakage control are possible | accuracy figures describe the pipeline, not real-world fraud |
 | SQLite over Postgres | real SQL, zero setup, and it sits behind SQLAlchemy so the swap is a config line | not suitable for concurrent production write load |
-| History queried per request | simple and exactly correct | fine for 90 days of history; at years of data this would need incremental running aggregates |
+| In-memory history per account, loaded from SQLite on first use | no database round trip after the first request, and bursts build live | held in one process: lost on restart and not shared across replicas; years of history would need running aggregates instead of full lists |
 | Two feature implementations | serving cannot use a batch pandas pass | requires a parity test to stay honest |
 | Logistic regression kept as a baseline | makes the gradient-boosted gain measurable rather than assumed | — |
 

@@ -17,7 +17,7 @@ import pandas as pd
 
 from db import SessionLocal
 from models import Account, Transaction
-from main import TransactionIn, compute_features, load_history
+from main import LiveHistory, TransactionIn, compute_features, load_history
 
 TOLERANCE = 1e-6      # float arithmetic will not be bit-identical across paths
 SAMPLE_PER_GROUP = 50
@@ -94,10 +94,27 @@ def main():
             if abs(float(want) - float(got)) > TOLERANCE:
                 failures.append(f"{txn_id}.{name}: offline={want} online={got}")
 
+    # The service reads history from an in-memory LiveHistory, not the SQL
+    # query above. It must hand back exactly the same prior transactions, in
+    # the same order - otherwise the features differ even though
+    # compute_features is shared.
+    live = LiveHistory()
+    history_mismatches = 0
+    for txn_id in sample:
+        row = session.get(Transaction, txn_id)
+        from_sql = [h.txn_id for h in load_history(session, row.account_id, row.ts)]
+        from_live = [h.txn_id for h in live.before(session, row.account_id, row.ts)]
+        if from_sql != from_live:
+            history_mismatches += 1
+            failures.append(f"{txn_id}: live history differs from SQL "
+                            f"({len(from_live)} vs {len(from_sql)} rows)")
+
     session.close()
 
     checked = len(sample) * len(FEATURES)
     print(f"compared {checked:,} values across {len(sample)} transactions")
+    print(f"compared live vs SQL history for {len(sample)} transactions, "
+          f"{history_mismatches} mismatch(es)")
 
     if failures:
         print(f"\nFAIL - {len(failures)} mismatch(es):")
