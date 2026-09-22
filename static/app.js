@@ -12,7 +12,10 @@ const state = {
   busy: false,
   advanceMs: 600000,
 };
-const session = Math.random().toString(36).slice(2, 7).toUpperCase();
+// Identifies this browser tab to the server, which keeps a separate live
+// history per visitor so simultaneous demo users never affect each other.
+const session = (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2))
+  .replace(/-/g, "").slice(0, 12).toUpperCase();
 
 const $ = (id) => document.getElementById(id);
 
@@ -107,7 +110,7 @@ function describe(name, v) {
 // ---------------------------------------------------------------- api
 async function api(path, opts = {}) {
   const res = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Visitor": session },
     ...opts,
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });

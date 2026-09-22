@@ -1,0 +1,17 @@
+# Render blueprint: one free web service that builds the synthetic world at
+# deploy time and serves both the console and the API from the same process.
+services:
+  - type: web
+    name: sentinel
+    runtime: python
+    plan: free
+    # sentinel.db is a build artifact (gitignored), so the build recreates it.
+    # The generator is seeded, so this rebuilds the same 189k transactions the
+    # committed model was trained on.
+    buildCommand: pip install -r requirements.txt && python init_db.py && python generate_data.py
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.14.3

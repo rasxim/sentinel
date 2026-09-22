@@ -1,8 +1,9 @@
 import bisect
 import math
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
@@ -98,55 +99,65 @@ class LiveHistory:
     first two. Scored transactions never go into the `transactions` table,
     which stays the untouched training set.
 
+    Histories are kept per visitor as well as per account, so two people
+    running the public demo on the same account at the same time never see
+    each other's transactions. The least recently used histories are dropped
+    once there are more than MAX_HISTORIES, which bounds memory.
+
     `before()` enforces the same as-of cutoff as the offline pipeline:
     only transactions strictly earlier than the one being scored.
     """
 
+    MAX_HISTORIES = 400
+
     def __init__(self):
-        self._by_account = {}
-        self._ids = {}
+        self._hist = OrderedDict()   # (visitor, account_id) -> [Seen, ...] sorted by ts
+        self._ids = {}               # (visitor, account_id) -> {txn_id, ...}
         # Sync endpoints run in a thread pool, so requests can overlap.
         self._lock = threading.Lock()
 
-    def _warm(self, session, account_id):
+    def _warm(self, session, key):
         rows = (session.query(Transaction)
-                .filter(Transaction.account_id == account_id)
+                .filter(Transaction.account_id == key[1])
                 .order_by(Transaction.ts)
                 .all())
-        self._by_account[account_id] = [
-            Seen(r.txn_id, r.ts, r.amount, r.merchant_id, r.lat, r.lon) for r in rows
-        ]
-        self._ids[account_id] = {r.txn_id for r in rows}
+        self._hist[key] = [Seen(r.txn_id, r.ts, r.amount, r.merchant_id, r.lat, r.lon) for r in rows]
+        self._ids[key] = {r.txn_id for r in rows}
+        while len(self._hist) > self.MAX_HISTORIES:
+            old, _ = self._hist.popitem(last=False)
+            self._ids.pop(old, None)
 
-    def before(self, session, account_id, ts):
+    def before(self, session, account_id, ts, visitor=""):
+        key = (visitor, account_id)
         with self._lock:
-            if account_id not in self._by_account:
-                self._warm(session, account_id)
-            hist = self._by_account[account_id]
+            if key not in self._hist:
+                self._warm(session, key)
+            self._hist.move_to_end(key)
+            hist = self._hist[key]
             cut = bisect.bisect_left(hist, ts, key=lambda h: h.ts)
             return hist[:cut]
 
-    def add(self, txn):
+    def add(self, txn, visitor=""):
         """Record a scored transaction. Returns False for a txn_id already seen,
         so replaying a real historical row does not count it twice."""
+        key = (visitor, txn.account_id)
         with self._lock:
-            hist = self._by_account.get(txn.account_id)
-            if hist is None or txn.txn_id in self._ids[txn.account_id]:
+            hist = self._hist.get(key)
+            if hist is None or txn.txn_id in self._ids[key]:
                 return False
             seen = Seen(txn.txn_id, txn.ts, txn.amount, txn.merchant_id, txn.lat, txn.lon)
             bisect.insort(hist, seen, key=lambda h: h.ts)
-            self._ids[txn.account_id].add(txn.txn_id)
+            self._ids[key].add(txn.txn_id)
             return True
 
-    def reset(self, account_id=None):
-        """Forget live additions. The next request reloads from SQLite."""
+    def reset(self, visitor="", account_id=None):
+        """Forget one visitor's live additions (for one account, or all of
+        theirs). The next request reloads from SQLite."""
         with self._lock:
-            if account_id is None:
-                self._by_account.clear()
-                self._ids.clear()
-            else:
-                self._by_account.pop(account_id, None)
-                self._ids.pop(account_id, None)
+            for key in [k for k in self._hist
+                        if k[0] == visitor and (account_id is None or k[1] == account_id)]:
+                self._hist.pop(key, None)
+                self._ids.pop(key, None)
 
 
 LIVE = LiveHistory()
@@ -406,7 +417,8 @@ def account_profile(account_id: str):
 
 
 @app.post("/score")
-def score_transaction(txn: TransactionIn):
+def score_transaction(txn: TransactionIn, x_visitor: str = Header(default="")):
+    visitor = x_visitor[:64]
     started = perf_counter()
     session = SessionLocal()
 
@@ -421,7 +433,7 @@ def score_transaction(txn: TransactionIn):
     typical_amount = account.typical_amount
     home_lat, home_lon = account.home_lat, account.home_lon
 
-    history = LIVE.before(session, txn.account_id, txn.ts)
+    history = LIVE.before(session, txn.account_id, txn.ts, visitor)
     feats = compute_features(txn, typical_amount, home_lat, home_lon, history)
 
     # XGBoost matches columns by POSITION, not name. Building the row in
@@ -460,7 +472,7 @@ def score_transaction(txn: TransactionIn):
     session.commit()
     session.close()
 
-    added = LIVE.add(txn)
+    added = LIVE.add(txn, visitor)
 
     # NaN is not valid JSON, so unknown values (an account's first-ever
     # transaction) go out as null.
@@ -484,7 +496,8 @@ def score_transaction(txn: TransactionIn):
 
 
 @app.post("/reset")
-def reset(account_id: str | None = None):
-    """Drop live additions so a demo can start again from the stored history."""
-    LIVE.reset(account_id)
+def reset(account_id: str | None = None, x_visitor: str = Header(default="")):
+    """Drop this visitor's live additions so a demo can start again from the
+    stored history. Never touches anyone else's."""
+    LIVE.reset(x_visitor[:64], account_id)
     return {"reset": account_id or "all accounts"}
