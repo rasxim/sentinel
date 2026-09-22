@@ -19,6 +19,7 @@ accuracy.
 | **Policy** | cost-optimised thresholds cut modelled loss **52%** vs a default 0.5 cut-off |
 | **Serving** | ~14 ms median, 17 ms p95 per decision, with an offline/online feature parity test |
 | **Validation** | adversarial probes found and fixed a data-generation leak — see below |
+| **Console** | browser UI with live scenarios and per-decision SHAP explanations |
 
 ---
 
@@ -337,7 +338,14 @@ python make_charts.py      # regenerate README figures
 uvicorn main:app
 ```
 
-Then open `http://127.0.0.1:8000/docs`.
+Then open **`http://127.0.0.1:8000`** for the scoring console, or `/docs` for the raw API.
+
+The console picks one clean demo account per city and lets you run four scenarios — an everyday
+purchase, a card-testing burst, impossible travel, and account takeover — or compose your own
+transaction. Each decision expands to show its three strongest reasons, taken from the model's
+own SHAP contributions (XGBoost `pred_contribs`), alongside all sixteen feature values. A
+simulated clock starts the morning after the account's last real purchase and advances with each
+transaction, which is what lets a burst or an impossible trip play out in real time.
 
 ```bash
 curl -X POST http://127.0.0.1:8000/score \

@@ -3,23 +3,31 @@ import math
 import threading
 from dataclasses import dataclass
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
+from sqlalchemy import func
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
 
 import joblib
 import pandas as pd
+import xgboost as xgb
 
-from models import Account, Decision, Transaction
+from models import Account, Decision, Merchant, Transaction
 from db import SessionLocal
 
 app = FastAPI()
+
+STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 MODEL_PATH = Path(__file__).parent / "model.joblib"
 bundle = joblib.load(MODEL_PATH)
 MODEL = bundle["model"]
 FEATURE_NAMES = bundle["features"]
+BOOSTER = MODEL.get_booster()
 print("loaded model with features:", FEATURE_NAMES)
 
 # Thresholds come from the sweep in cost_curve.py, not from taste. 0.5 is a
@@ -222,9 +230,151 @@ def compute_features(txn, typical_amount, home_lat, home_lon, history):
     }
 
 
+def explain(X, top=3):
+    """The features that moved this score the most, from the model itself.
+
+    XGBoost's pred_contribs returns each feature's exact SHAP contribution to
+    the score in log-odds; positive raised the fraud risk, negative lowered it.
+    The contributions plus the bias term sum to the model's raw output, so these
+    are the real reasons for this prediction, not a separate approximation.
+    """
+    contribs = BOOSTER.predict(xgb.DMatrix(X), pred_contribs=True)[0][:-1]
+    order = sorted(range(len(FEATURE_NAMES)), key=lambda i: abs(contribs[i]), reverse=True)
+    return [{"feature": FEATURE_NAMES[i], "contribution": round(float(contribs[i]), 3)}
+            for i in order[:top]]
+
+
+def km(lat1, lon1, lat2, lon2):
+    return round(haversine_km(lat1, lon1, lat2, lon2))
+
+
+def merchant_out(m, home_lat, home_lon, visits=None):
+    out = {"merchant_id": m.merchant_id, "name": m.name, "category": m.category,
+           "city": m.city, "lat": m.lat, "lon": m.lon,
+           "km_from_home": km(home_lat, home_lon, m.lat, m.lon)}
+    if visits is not None:
+        out["visits"] = visits
+    return out
+
+
+_DEMO_ACCOUNTS = None
+
+
+def demo_accounts(session):
+    """One clean account per city for the demo, chosen once and cached.
+
+    "Clean" means no planted fraud in its history, so every score a visitor
+    sees is the model reacting to what they send and nothing else.
+    """
+    global _DEMO_ACCOUNTS
+    if _DEMO_ACCOUNTS is not None:
+        return _DEMO_ACCOUNTS
+
+    fraud_ids = {r[0] for r in session.query(Transaction.account_id)
+                 .filter(Transaction.is_fraud == True).distinct()}  # noqa: E712
+    counts = dict(session.query(Transaction.account_id, func.count())
+                  .group_by(Transaction.account_id).all())
+
+    by_city = {}
+    for a in session.query(Account).order_by(Account.account_id):
+        if a.account_id not in fraud_ids:
+            by_city.setdefault(a.home_city, []).append(a)
+
+    picked = []
+    for city in sorted(by_city):
+        accts = by_city[city]
+        chosen = next((a for a in accts if a.account_id == "ACC00042"), None)
+        if chosen is None:
+            chosen = min(accts, key=lambda a: abs(counts.get(a.account_id, 0) - 100))
+        picked.append({"account_id": chosen.account_id, "home_city": chosen.home_city,
+                       "typical_amount": chosen.typical_amount,
+                       "n_transactions": counts.get(chosen.account_id, 0)})
+
+    _DEMO_ACCOUNTS = picked
+    return picked
+
+
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse(STATIC_DIR / "index.html")
+
+
 @app.get("/health")
 def root():
     return {"status": "ok"}
+
+
+@app.get("/meta")
+def meta():
+    return {"model": "XGBoost", "n_features": len(FEATURE_NAMES),
+            "review_threshold": REVIEW_THRESHOLD, "decline_threshold": DECLINE_THRESHOLD}
+
+
+@app.get("/accounts")
+def list_accounts():
+    session = SessionLocal()
+    try:
+        return demo_accounts(session)
+    finally:
+        session.close()
+
+
+@app.get("/accounts/{account_id}")
+def account_profile(account_id: str):
+    """Everything the console needs to show an account and build transactions for it."""
+    session = SessionLocal()
+    try:
+        a = session.get(Account, account_id)
+        if a is None:
+            raise HTTPException(status_code=404, detail=f"account {account_id} not found")
+
+        txns = (session.query(Transaction)
+                .filter(Transaction.account_id == account_id)
+                .order_by(Transaction.ts).all())
+        merchants = {m.merchant_id: m for m in session.query(Merchant).all()}
+
+        visits = {}
+        for t in txns:
+            visits[t.merchant_id] = visits.get(t.merchant_id, 0) + 1
+
+        favourites = [merchant_out(merchants[mid], a.home_lat, a.home_lon, n)
+                      for mid, n in sorted(visits.items(), key=lambda kv: -kv[1])[:5]]
+
+        local_new = [merchant_out(m, a.home_lat, a.home_lon)
+                     for m in sorted(merchants.values(), key=lambda m: m.merchant_id)
+                     if m.city == a.home_city and m.merchant_id not in visits][:5]
+
+        elsewhere, seen_cities = [], set()
+        for m in sorted(merchants.values(), key=lambda m: m.merchant_id):
+            if m.city != a.home_city and m.city not in seen_cities and m.merchant_id not in visits:
+                seen_cities.add(m.city)
+                elsewhere.append(merchant_out(m, a.home_lat, a.home_lon))
+        elsewhere.sort(key=lambda m: m["km_from_home"])
+
+        recent = [{"ts": t.ts.isoformat(), "amount": t.amount,
+                   "merchant": merchants[t.merchant_id].name,
+                   "category": merchants[t.merchant_id].category,
+                   "city": merchants[t.merchant_id].city,
+                   "card_present": bool(t.card_present)}
+                  for t in reversed(txns[-5:])]
+
+        return {
+            "account_id": a.account_id,
+            "home_city": a.home_city,
+            "home_lat": a.home_lat,
+            "home_lon": a.home_lon,
+            "typical_amount": a.typical_amount,
+            "n_transactions": len(txns),
+            "distinct_merchants": len(visits),
+            "first_ts": txns[0].ts.isoformat() if txns else None,
+            "last_ts": txns[-1].ts.isoformat() if txns else None,
+            "favourites": favourites,
+            "local_new": local_new,
+            "elsewhere": elsewhere,
+            "recent": recent,
+        }
+    finally:
+        session.close()
 
 
 @app.post("/score")
@@ -251,6 +401,7 @@ def score_transaction(txn: TransactionIn):
     # wrong and you get confident nonsense, with no error and no warning.
     X = pd.DataFrame([[feats[name] for name in FEATURE_NAMES]], columns=FEATURE_NAMES)
     fraud_probability = float(MODEL.predict_proba(X)[0, 1])
+    reasons = explain(X)
 
     if fraud_probability >= DECLINE_THRESHOLD:
         decision = "DECLINE"
@@ -290,6 +441,7 @@ def score_transaction(txn: TransactionIn):
         "history_used": len(history),
         "added_to_history": added,
         "features": features_out,
+        "reasons": reasons,
         "latency_ms": round((perf_counter() - started) * 1000, 1),
     }
 

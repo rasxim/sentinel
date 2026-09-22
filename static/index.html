@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sentinel — fraud scoring console</title>
+  <meta name="description" content="Real-time card fraud scoring with point-in-time features and cost-based decision thresholds.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="wordmark" href="/" aria-label="Sentinel home">
+      <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+        <rect x="0.5" y="0.5" width="17" height="17" rx="3" fill="none" stroke="currentColor"/>
+        <path d="M4 12.5 L7.5 8.5 L10 10.5 L14 5.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="14" cy="5.5" r="1.6" fill="var(--decline)"/>
+      </svg>
+      <span>Sentinel</span>
+    </a>
+    <nav class="topnav">
+      <span class="model-chip mono" id="model-chip">XGBoost</span>
+      <a href="https://github.com/rasxim/sentinel#readme" target="_blank" rel="noopener">How it works</a>
+      <a href="https://github.com/rasxim/sentinel" target="_blank" rel="noopener">Source</a>
+    </nav>
+  </div>
+</header>
+
+<main class="page">
+  <section class="intro">
+    <h1>Fraud scoring console</h1>
+    <p>Each transaction is scored against this account's own history — how often it spends, where,
+      and how much — then routed to approve, review, or decline using thresholds chosen by expected cost.
+      Run a scenario, or compose a transaction and watch the model decide.</p>
+  </section>
+
+  <div class="layout">
+    <aside class="rail">
+
+      <section class="panel" aria-labelledby="acct-h">
+        <div class="panel-head">
+          <h2 id="acct-h" class="label">Account</h2>
+          <select id="account-select" aria-label="Choose account"></select>
+        </div>
+        <div class="acct-id">
+          <span class="mono" id="acct-id">—</span>
+          <span class="muted" id="acct-city"></span>
+        </div>
+        <dl class="stats">
+          <div><dt>Usual spend</dt><dd class="mono" id="stat-spend">—</dd></div>
+          <div><dt>History</dt><dd class="mono" id="stat-history">—</dd></div>
+          <div><dt>Merchants</dt><dd class="mono" id="stat-merchants">—</dd></div>
+        </dl>
+        <div class="sublabel">Recent activity</div>
+        <ul class="recent" id="recent"></ul>
+      </section>
+
+      <section class="panel" aria-labelledby="scen-h">
+        <h2 id="scen-h" class="label">Scenarios</h2>
+        <ol class="scenarios" id="scenarios"></ol>
+      </section>
+
+      <section class="panel" aria-labelledby="comp-h">
+        <h2 id="comp-h" class="label">Compose a transaction</h2>
+        <form id="compose" novalidate>
+          <label class="field">
+            <span>Merchant</span>
+            <select id="f-merchant"></select>
+            <small class="hint" id="f-merchant-hint"></small>
+          </label>
+          <div class="field-row">
+            <label class="field">
+              <span>Amount</span>
+              <div class="money"><span aria-hidden="true">$</span><input id="f-amount" inputmode="decimal" value="25.00" autocomplete="off"></div>
+              <small class="hint" id="f-amount-hint"></small>
+            </label>
+            <label class="field">
+              <span>Payment</span>
+              <select id="f-present">
+                <option value="1">In person</option>
+                <option value="0">Online</option>
+              </select>
+            </label>
+          </div>
+          <fieldset class="field">
+            <legend>Time since previous</legend>
+            <div class="segmented" id="f-advance" role="radiogroup">
+              <button type="button" role="radio" data-ms="60000">1 min</button>
+              <button type="button" role="radio" data-ms="600000" aria-checked="true">10 min</button>
+              <button type="button" role="radio" data-ms="3600000">1 hour</button>
+              <button type="button" role="radio" data-ms="86400000">1 day</button>
+            </div>
+          </fieldset>
+          <p class="form-error" id="f-error" role="alert"></p>
+          <button class="btn btn-primary" type="submit" id="f-submit">Score transaction</button>
+        </form>
+      </section>
+
+    </aside>
+
+    <section class="feed-wrap" aria-labelledby="feed-h">
+      <div class="toolbar">
+        <div class="clock">
+          <span class="label">Simulated time</span>
+          <span class="mono" id="clock">—</span>
+        </div>
+        <div class="tally" aria-live="polite">
+          <span class="tally-item"><i class="dot dot-approve"></i><span class="mono" id="n-approve">0</span> approved</span>
+          <span class="tally-item"><i class="dot dot-review"></i><span class="mono" id="n-review">0</span> review</span>
+          <span class="tally-item"><i class="dot dot-decline"></i><span class="mono" id="n-decline">0</span> declined</span>
+          <span class="tally-item muted"><span class="mono" id="latency">—</span> median</span>
+          <button class="btn btn-ghost" type="button" id="reset">Reset</button>
+        </div>
+      </div>
+
+      <h2 id="feed-h" class="sr-only">Decisions</h2>
+      <div class="feed-head" aria-hidden="true">
+        <span>Time</span><span>Merchant</span><span class="num">Amount</span><span>Fraud risk</span><span>Decision</span><span></span>
+      </div>
+      <ol class="feed" id="feed"></ol>
+      <div class="empty" id="empty">
+        <p class="empty-title">No transactions scored yet</p>
+        <p>Run a scenario on the left. The card-testing burst is the best place to start —
+          watch the score climb as each charge lands.</p>
+      </div>
+
+      <div class="legend">
+        <div class="scale" aria-hidden="true">
+          <span class="zone z-approve"></span><span class="zone z-review"></span><span class="zone z-decline"></span>
+        </div>
+        <p class="muted">Risk bar uses a log-odds scale, so both near-zero and near-certain scores stay readable. Review from <span class="mono" id="lg-review">0.05</span>,
+          decline from <span class="mono" id="lg-decline">0.85</span> — cut-offs picked by minimising expected cost
+          ($200 per missed fraud, $50 per wrongly declined customer), not the default 0.5.</p>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer class="footer">
+  <p>Synthetic data: 189,230 transactions across 2,000 accounts with three planted fraud patterns.
+    Scores reflect those patterns, not real card traffic.</p>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
